@@ -382,6 +382,31 @@ impl Completions {
                 .await
                 .ok_or_else(|| {
                     let raw = String::from_utf8_lossy(&buf);
+                    // 检查是否为 biz_code 业务错误（如 mute 返回纯 JSON 而非 SSE）
+                    if let Some(biz_code) = raw
+                        .lines()
+                        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                        .and_then(|v| v.pointer("/data/biz_code").and_then(|c| c.as_i64()))
+                    {
+                        let biz_msg = raw
+                            .lines()
+                            .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                            .and_then(|v| {
+                                v.pointer("/data/biz_msg")
+                                    .and_then(|m| m.as_str().map(String::from))
+                            })
+                            .unwrap_or_default();
+                        log::error!(
+                            target: "ds_core::accounts",
+                            "req={} SSE 流返回业务错误: biz_code={}, biz_msg={}",
+                            request_id, biz_code, biz_msg
+                        );
+                        self.pool.mark_error(&account_id);
+                        return CoreError::ProviderError(format!(
+                            "biz_code={}, {}",
+                            biz_code, biz_msg
+                        ));
+                    }
                     log::error!(
                         target: "ds_core::accounts",
                         "req={} 空 SSE 流, 已收到 {} 字节: {}", request_id, buf.len(), raw

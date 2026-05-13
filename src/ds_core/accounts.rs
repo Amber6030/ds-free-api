@@ -97,6 +97,19 @@ impl Account {
     pub fn is_available(&self) -> bool {
         self.state() == AccountState::Idle
     }
+
+    /// 创建一个 Invalid 状态的账号（初始化失败时使用，仍加入池以便前台展示）
+    fn new_invalid(creds: AccountConfig) -> Self {
+        Self {
+            token: std::sync::RwLock::new(String::new().into()),
+            email: creds.email.clone(),
+            mobile: creds.mobile.clone(),
+            state: AtomicU8::new(AccountState::Invalid as u8),
+            last_released: AtomicI64::new(0),
+            error_count: AtomicU8::new(MAX_ERROR_COUNT),
+            creds,
+        }
+    }
 }
 
 /// 持有期间账号标记为 busy，Drop 时自动释放
@@ -206,30 +219,37 @@ impl AccountPool {
                     } else {
                         creds.mobile.clone()
                     };
-                    match init_account(&creds, &client, &solver).await {
+                    let account = match init_account(&creds, &client, &solver).await {
                         Ok(account) => {
                             info!(target: "ds_core::accounts", "账号 {} 初始化成功", display_id);
-                            Some((display_id, Arc::new(account)))
+                            account
                         }
                         Err(e) => {
                             warn!(target: "ds_core::accounts", "账号 {} 初始化失败: {}", display_id, e);
-                            None
+                            // 即使初始化失败也加入池，标记为 Invalid 以便前台展示
+                            Account::new_invalid(creds.clone())
                         }
-                    }
+                    };
+                    Some((display_id, Arc::new(account)))
                 }
             })
             .collect();
 
-        let results = join_all(futures).await;
-        let initialized: Vec<(String, Arc<Account>)> = results.into_iter().flatten().collect();
+        let results: Vec<(String, Arc<Account>)> =
+            join_all(futures).await.into_iter().flatten().collect();
+        let idle_count = results
+            .iter()
+            .filter(|(_, a)| a.state() == AccountState::Idle)
+            .count();
 
-        if initialized.is_empty() {
-            error!(target: "ds_core::accounts", "所有账号初始化失败");
-            return Err(PoolError::AllAccountsFailed);
+        for (id, account) in &results {
+            self.accounts.insert(id.clone(), Arc::clone(account));
         }
 
-        for (id, account) in initialized {
-            self.accounts.insert(id, account);
+        if idle_count == 0 {
+            warn!(target: "ds_core::accounts", "所有账号初始化失败：账号可能被禁用或凭据错误");
+        } else if results.len() > 1 && idle_count < results.len() {
+            warn!(target: "ds_core::accounts", "{}/{} 个账号不可用", results.len() - idle_count, results.len());
         }
         Ok(())
     }
@@ -473,21 +493,7 @@ async fn init_account(
     client: &DsClient,
     solver: &PowSolver,
 ) -> Result<Account, PoolError> {
-    let mut last_error = None;
-
-    for attempt in 1..=3 {
-        match try_init_account(creds, client, solver).await {
-            Ok(account) => return Ok(account),
-            Err(e) => {
-                last_error = Some(e);
-                if attempt < 3 {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                }
-            }
-        }
-    }
-
-    Err(last_error.expect("循环至少执行一次"))
+    try_init_account(creds, client, solver).await
 }
 
 async fn try_init_account(
@@ -589,9 +595,28 @@ async fn health_check(
     };
 
     let mut stream = client.completion(token, &pow_header, &payload).await?;
-    // 消费流确保消息写入
+    // 消费流并检查是否收到正常 SSE（健康账号应有 ready/response 事件）
+    let mut data = Vec::new();
     while let Some(chunk) = stream.try_next().await? {
-        let _ = chunk;
+        data.extend_from_slice(&chunk);
+    }
+
+    let text = String::from_utf8_lossy(&data);
+
+    // 检测账号是否异常（muted / 限流等）
+    if text.contains(r#""biz_code":"#) {
+        error!(
+            target: "ds_core::accounts",
+            "health_check 检测到业务错误: account={}, response={}",
+            display_id,
+            text.lines().find(|l| l.contains("biz_code")).unwrap_or(&text)
+        );
+        return Err(PoolError::Validation("账号异常(muted/limited)".into()));
+    }
+
+    // 检查 SSE 流是否正常结束
+    if !text.contains(r#""FINISHED""#) && !text.contains(r#""INCOMPLETE""#) {
+        return Err(PoolError::Validation("SSE 流未正常结束".into()));
     }
 
     debug!(

@@ -23,11 +23,11 @@ from openai import OpenAI
 from anthropic import Anthropic
 
 def load_config() -> dict:
-    """加载 e2e 配置，计算安全并发数和端口"""
+    """加载 e2e 配置，计算安全并发数、端口和模型列表"""
     config_path = Path(__file__).parent / "config.toml"
     if not config_path.exists():
         print("[警告] 未找到 config.toml，默认配置")
-        return {"accounts": 1, "safe_concurrency": 1, "api_key": "sk-test", "port": 22217}
+        return {"accounts": 1, "safe_concurrency": 1, "api_key": "sk-test", "port": 22217, "models": ["deepseek-default"]}
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
     accounts = len(config.get("accounts", []))
@@ -35,7 +35,10 @@ def load_config() -> dict:
     api_keys = config.get("api_keys", [])
     api_key = api_keys[0]["key"] if api_keys else "sk-test"
     port = config.get("server", {}).get("port", 22217)
-    return {"accounts": accounts, "safe_concurrency": safe, "api_key": api_key, "port": port}
+    # 从 deepseek.model_types 动态生成模型 ID（如 ["default","expert","vision"] → ["deepseek-default","deepseek-expert","deepseek-vision"]）
+    model_types = config.get("deepseek", {}).get("model_types", ["default"])
+    models = [f"deepseek-{t}" for t in model_types]
+    return {"accounts": accounts, "safe_concurrency": safe, "api_key": api_key, "port": port, "models": models}
 
 
 def load_scenarios(scenario_dir: str, endpoint: str | None, filter_names: list[str] | None) -> list[dict]:
@@ -346,7 +349,8 @@ def main():
     args = parser.parse_args()
 
     scenarios = load_scenarios(args.scenario_dir, args.endpoint, args.filter)
-    models = [args.model] if args.model else list(dict.fromkeys(m for s in scenarios for m in s.get("models", ["deepseek-default"])))
+    # 模型来源：--model 参数优先，否则从 config.toml 动态获取
+    models = [args.model] if args.model else config.get("models", ["deepseek-default"])
 
     port = config["port"]
     oai_client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key=api_key)

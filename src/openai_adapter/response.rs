@@ -635,9 +635,8 @@ mod tests {
         }
 
         frames.push(sse_bytes(
-            "data: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n",
+            "data: {\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}\n\n",
         ));
-        frames.push(sse_bytes("event: finish\ndata: {}\n\n"));
 
         frames
     }
@@ -934,8 +933,7 @@ mod tests {
             data: {\"p\":\"response/fragments\",\"o\":\"APPEND\",\"v\":[{\"type\":\"THINK\",\"content\":\"继续\"}]}\n\n\
             data: {\"p\":\"response/fragments\",\"o\":\"APPEND\",\"v\":[{\"type\":\"RESPONSE\",\"content\":\"\"}]}\n\n\
             data: {\"p\":\"response/fragments/-1/content\",\"o\":\"APPEND\",\"v\":\"hello\"}\n\n\
-            data: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n\
-            event: finish\ndata: {}\n\n";
+            data: {\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}\n\n";
         let bytes_stream = futures::stream::iter(vec![sse_bytes(fixture)]);
         let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,

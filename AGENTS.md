@@ -84,6 +84,7 @@ src/
 - `examples/adapter_cli.rs` + `examples/adapter_cli/` — debug CLI + JSON request samples
 - `py-e2e-tests/` — Python e2e test suite (uv-managed, JSON-driven scenarios)
 - `docs/` — `code-style.md`, `logging-spec.md`, `deepseek-prompt-injection.md`, `deepseek-api-reference.md`, `development.md`; English translations under `docs/en/`
+- `docs/en/` — English translations of the Chinese docs in `docs/` (mirror structure)
 
 ### Binary / Library Split
 

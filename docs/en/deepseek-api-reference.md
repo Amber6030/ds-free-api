@@ -8,6 +8,7 @@
 - All requests: `User-Agent` required (WAF bypass)
 - Auth requests: `Authorization: Bearer <token>`
 - PoW requests: `X-Ds-Pow-Response: <base64>`
+- **`X-Client-Version: 2.0.0`** — The client version this document corresponds to (if behavior differs, check this version first)
 
 ### Error Response Formats
 - **Missing field** → HTTP 422: `{"detail":[{"loc":"body.<field>"}]}`
@@ -200,6 +201,8 @@ event: ready
 data: {"request_message_id":1,"response_message_id":2,"model_type":"expert"}
 ```
 
+**Note**: `ready` is typically followed by an `event: update_session`. This is a normal session update, not an end-of-stream signal.
+
 **2. `update_session` — Session updated**
 ```
 event: update_session
@@ -240,31 +243,149 @@ All incremental updates use a unified data format, combining `"p"` (path) and `"
   data: {"v":{"response":{"message_id":2,"parent_id":1,"model":"","role":"ASSISTANT","fragments":[{"id":2,"type":"RESPONSE","content":"Hello"}]}}}
   ```
 
+### Delta Parsing Algorithm
+
+The complete delta parsing logic from `chat.deepseek.com` frontend JS source, used to process all incremental update events:
+
+```javascript
+class DeltaParser {
+    constructor() {
+        this.op = "SET";   // default operator
+        this.path = "";    // default path
+    }
+
+    parse(event) {
+        // path/op persist across events: subsequent events may omit p/o
+        let op  = this.op  = event.o ?? this.op;
+        let path = this.path = event.p ?? this.path;
+
+        // Non-BATCH: return a single operation
+        if (op !== "BATCH")
+            return [{ path, op, value: event.v }];
+
+        // BATCH: decompose each item in the array
+        let subParser = new DeltaParser;
+        let results = [];
+        for (let item of event.v) {
+            let sub = subParser.parse(item);
+            // Prepend parent path: sub-item p is relative to parent
+            for (let s of sub)
+                s.path = (path ? path + "/" : "") + s.path;
+            results.push(...sub);
+        }
+        return results;
+    }
+}
+```
+
+**Key rules:**
+
+| Rule | Description |
+|------|-------------|
+| **`p` and `o` persist across events** | Subsequent events may omit `p`/`o`, inheriting from the previous event (applies to bare `v` and bare `v` arrays) |
+| **`o` defaults to `"SET"`** | Events without `o` (e.g., initial snapshot) use SET semantics on an empty path |
+| **`APPEND` on string = `+=`** | Pure incremental append; no snapshot replacement semantics |
+| **`BATCH` recursive decomposition** | Creates a sub-parser to recursively process `v` array; sub-item `p` is prepended with the parent path |
+| **Only 3 operation types** | `SET` (replace), `APPEND` (append), `BATCH` (batch); no other operators |
+
+**The corresponding state update engine (`rm` class):**
+
+```javascript
+switch (op) {
+case "SET":
+    target[resolvePath(lastPart)] = value;    // direct assignment
+    break;
+case "APPEND":
+    if (typeof value === "string")
+        target[resolvePath(lastPart)] += value;  // string concatenation
+    else if (Array.isArray(value))
+        // array merge (push or splice at negative index)
+    break;
+}
+```
+
+**Guidance for parser implementations:**
+1. Maintain `current_path` and `current_op` state vars that persist across events
+2. BATCH events: recursively decompose array items; prepend parent path to sub-item paths
+3. `response/fragments/-1`-level BATCH: sub-items update fragment sub-fields (content, references, etc.), paths prepended to `response/fragments/-1/{sub_path}`
+4. Content fields only use `+=`; no snapshot detection or dedup needed
+
 ### SSE Stream Status Paths (dynamic fields under `response/`)
 
 **Important: content is organized via the `fragments` array; use `-1` index to access the last fragment**
 
-| Path | thinking=OFF | thinking=ON | search=OFF | search=ON |
-|------|:---:|:---:|:---:|:---:|
-| `response/fragments/-1/content` | ✅ `type: RESPONSE` | ✅ THINK→RESPONSE | ✅ | ✅ |
-| `response/fragments/-1/elapsed_secs` | ❌ | ✅ thinking time (s) | - | - |
-| `response/search_status` | - | - | ❌ | ✅ `SEARCHING` → `FINISHED` |
-| `response/search_results` | - | - | ❌ | ✅ array `{url, title, snippet}` |
-| `response/accumulated_token_usage` | ✅ | ✅ | ✅ | ✅ |
-| `response/quasi_status` | ✅ | ✅ | ✅ | ✅ appears in BATCH |
-| `response/status` | ✅ `WIP`→`FINISHED` | ✅ | ✅ | ✅ |
+| Path / Field | Description |
+|------|------|
+| `response/fragments/-1/content` | Content of the last fragment (APPEND or SET) |
+| `response/fragments/-1/elapsed_secs` | Think/search elapsed time (seconds), THINK only |
+| `response/fragments/-1/status` | Fragment status (`WIP` → `FINISHED`), for TOOL_SEARCH/TOOL_OPEN |
+| `response/fragments/-{n}/status` | Negative index to mark any fragment done (parallel batch) |
+| `response/conversation_mode` | Session mode: `"DEFAULT"` or `"DEEP_SEARCH"` |
+| `response/has_pending_fragment` | `bool`, true when a fragment is being processed in the background |
+| `response/search_status` | `"SEARCHING"` → `"FINISHED"` |
+| `response/search_results` | Search result array `{url, title, snippet}` |
+| `response/accumulated_token_usage` | Cumulative token usage |
+| `response/quasi_status` | End signal inside BATCH, values: `"FINISHED"` or `"INCOMPLETE"` |
+| `response/status` | Main status `WIP` → `FINISHED` or `"INCOMPLETE"` |
 
 ### Fragment Structure
 
 ```typescript
 {
-  id: number,           // fragment sequence number
-  type: "THINK" | "RESPONSE",  // type discriminator
-  content: string,      // text content
-  elapsed_secs?: number, // THINK type only: thinking time in seconds
-  references: [],       // references (currently empty)
-  stage_id: number      // stage ID
+  id: number,                    // fragment sequence number
+  type: "THINK" | "RESPONSE"     // basic types
+      | "TOOL_SEARCH"            // search query (with queries + results sub-fields)
+      | "TOOL_OPEN"              // open link (with result + reference sub-fields)
+      | "TIP",                   // tip banner (with style + hide_on_wip sub-fields)
+  content: string | null,        // text content (null for TOOL_SEARCH/TOOL_OPEN)
+  elapsed_secs?: number,         // THINK type: thinking time in seconds
+  status?: "WIP" | "FINISHED",   // TOOL_SEARCH/TOOL_OPEN completion status
+  queries?: Array<{ query: string }>,  // TOOL_SEARCH: multiple search terms
+  results?: Array<{              // TOOL_SEARCH: search result list
+    url: string,
+    title: string,
+    snippet: string,
+    published_at?: number,
+    site_icon?: string,
+    site_name?: string,
+    query_indexes?: number[],
+  }>,
+  result?: {                     // TOOL_OPEN: single link content
+    url: string,
+    title: string,
+    snippet: string,
+    published_at?: number,
+    site_icon?: string,
+    site_name?: string,
+    query_indexes?: number[],
+  },
+  reference?: {                  // TOOL_OPEN: associated search reference
+    id: number,
+    type: "TOOL_SEARCH",
+  },
+  style?: "WARNING",             // TIP type: style
+  hide_on_wip?: boolean,          // TIP type: hide while streaming
+  references?: Array<{           // RESPONSE content reference associations
+    id: number,
+    type: "TOOL_SEARCH" | "TOOL_OPEN",
+  }>,
+  stage_id: number               // stage ID
 }
+```
+
+### Content Reference Markers
+
+In RESPONSE-type fragment content, DeepSeek uses `[reference:N]` markers to cite search results or opened links. Reference markers are injected via fragment-level BATCH operations:
+
+```
+# Append reference marker and set references field on current fragment
+data: {"p":"response/fragments/-1","o":"BATCH","v":[
+  {"p":"content","o":"APPEND","v":"[reference:0]"},
+  {"p":"references","o":"SET","v":[{"id":3,"type":"TOOL_SEARCH"}]}
+]}
+
+# Continue BATCH operations on the same path (bare v array)
+data: {"v":[{"p":"content","o":"APPEND","v":"[reference:1]"},{"p":"references","v":[{"id":5,"type":"TOOL_OPEN"}]}]}
 ```
 
 ### Differentiating Thinking Content from Actual Output
@@ -276,20 +397,39 @@ type == "THINK"     → Thinking content (only appears when thinking=ON)
 type == "RESPONSE"  → Actual output content
 ```
 
-**Stream phase order (thinking=ON, search=ON):**
+**Stream phase order (thinking=ON, search=ON, with search and fetch):**
+
+> Search-related steps only appear when DeepSeek determines web search is needed. In DEEP_SEARCH mode, multiple rounds of THINK → TOOL_SEARCH → TOOL_OPEN → THINK may occur.
 
 ```
-1. SEARCHING   → p=response/search_status, v="SEARCHING"
-2. SEARCH      → p=response/search_results, v=[{url, title, snippet}, ...]
-3. SEARCH END  → p=response/search_status, v="FINISHED"
-4. SNAPSHOT    → {"v":{"response":{..., "fragments":[{"type":"THINK","content":""}]}}}
-5. THINKING    → p=response/fragments/-1/content, o="APPEND", v="..."
-6. THINK END   → p=response/fragments/-1/elapsed_secs, o="SET", v=0.95
-7. RESPONSE    → p=response/fragments, o="APPEND", v=[{"type":"RESPONSE","content":"..."}]
-8. CONTENT     → p=response/fragments/-1/content, v="..." (continues appending)
-9. BATCH       → p=response, o="BATCH", v=[{accumulated_token_usage},{quasi_status}]
-10. DONE       → p=response/status, o="SET", v="FINISHED"
+ 1. SNAPSHOT    → {"v":{"response":{..., "fragments":[{"type":"THINK","content":""}]}}}
+ 2. THINKING    → p=response/fragments/-1/content, o="APPEND", v="..."
+ 3. (optional)  → p=response/conversation_mode, v="DEEP_SEARCH"
+ 4. THINK END   → p=response/fragments/-1/elapsed_secs, o="SET", v=...
+ 5. TOOL_SEARCH → p=response, o="BATCH", v=[{"p":"fragments","o":"APPEND","v":[
+                    {"id":N,"type":"TOOL_SEARCH","queries":[...]}]},...]
+ 6. SEARCH      → p=response/fragments/-1/results, o="SET", v=[...] (large result set)
+ 7. SEARCH END  → p=response/fragments/-1/status, v="FINISHED"
+ 8. THINK(2)    → BATCH APPEND new THINK fragment (evaluating results)
+ 9. THINKING(2) → p=response/fragments/-1/content, o="APPEND", v="..."
+10. THINK END(2)→ p=response/fragments/-1/elapsed_secs, o="SET", v=...
+11. TOOL_OPEN   → BATCH APPEND multiple TOOL_OPEN fragments (batch open links)
+12. OPEN END    → p=response/fragments/-{n}/status, v="FINISHED" (batch marking)
+13. THINK(3)    → BATCH APPEND new THINK fragment (organizing for answer)
+14. THINKING(3) → p=response/fragments/-1/content, o="APPEND", v="..."
+15. THINK END(3)→ p=response/fragments/-1/elapsed_secs, o="SET", v=...
+16. RESPONSE    → p=response/fragments, o="APPEND", v=[{"type":"RESPONSE","content":"..."}]
+17. CONTENT     → p=response/fragments/-1/content, v="..." (continues, may lack o)
+18. REFERENCE   → p=response/fragments/-1, o="BATCH", v=[{inject reference}, {set refs}]
+19. CONTENT     → p=response/fragments/-1/content, o="APPEND", v="..." (continues)
+20. TIP         → p=response/fragments, v=[{"type":"TIP","style":"WARNING",...}]
+21. BATCH       → p=response, o="BATCH", v=[{accumulated_token_usage},{quasi_status}]
+22. DONE        → p=response/status, o="SET", v="FINISHED" (normal)
+                  → p=response/status, o="SET", v="INCOMPLETE" (manual stop)
 ```
+
+> Note: TOOL_OPEN fragments are marked done via batch negative-index status updates (e.g. `fragments/-7/status`), not individually.
+> `event: finish` is typically absent. `update_session`, `title`, `close` appear after status=FINISHED.
 
 **Stream phase order (thinking=OFF, search=OFF):**
 
@@ -300,7 +440,7 @@ type == "RESPONSE"  → Actual output content
 4. DONE        → p=response/status, o="SET", v="FINISHED"
 ```
 
-**Implementation note:** When parsing the SSE stream, maintain a `current_path` state variable. Update it when a `p` field appears; subsequent `{"v":"..."}` or `{"o":"APPEND","v":"..."}` belong to that path. For `fragments/-1`, this refers to the last element in the array.
+**Implementation note:** BATCH events are recursively decomposed into SET/APPEND operations, each of which resolves the path on the message object and updates the corresponding field. Content fields always use APPEND (`+=`).
 
 **4. `hint` — Server hint/error (must handle)**
 ```
@@ -312,30 +452,37 @@ data: {"type":"error","content":"Content is too long. Please shorten it and try 
 - `clear_response`: When true, indicates existing output should be cleared
 - `finish_reason`: `"input_exceeds_limit"` (input too long), `"rate_limit_reached"` (rate limited), etc.
 
-**Note**: The hint event is always the second SSE event (immediately after `ready`). Stream handlers should check whether the second event is a hint with `type=error`; if so, actively terminate the stream and return an error (e.g. `Overloaded` or `BadRequest`), rather than continuing to wait for subsequent events.
+**Note**: The hint event typically appears shortly after `ready`. Stream handlers should terminate the stream and return an error (e.g. `Overloaded` or `BadRequest`) upon receiving a hint, rather than continuing to wait for subsequent events. An `update_session` event may appear between `ready` and `hint`.
 
-**5. Stream end sequence (in order):**
+### Stream end sequence (including interruption)
+
+The stream can terminate with two status values: `"FINISHED"` (normal completion) and `"INCOMPLETE"` (manual stop / abnormal termination). The sequence is as follows:
 
 ```
-data: {"p":"response/status","v":"FINISHED"}
+# Normal completion
+data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":139},{"p":"quasi_status","v":"FINISHED"}]}
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
 
-event: finish
-data: {}
+# Manual stop (may have no RESPONSE fragment at all)
+data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":39},{"p":"quasi_status","v":"INCOMPLETE"}]}
+data: {"p":"response/status","v":"INCOMPLETE"}                         # No o field
+# elapsed_secs SET may arrive after INCOMPLETE
 
+# Subsequent sequence (same for both)
 event: update_session
-data: {"updated_at":1775387665.945004}
+data: {"updated_at":1778639258.866693}
 
-event: title          # Only appears when thinking=OFF and search=OFF
-data: {"content":"Greeting Assistance"}
+event: title
+data: {"content":"Rust所有权概念解释"}
 
 event: close
 data: {"click_behavior":"none","auto_resume":false}
 ```
 
 - `close`: Session end signal. `click_behavior` controls click behavior (`"none"` or `"retry"`), `auto_resume` indicates whether the session can auto-resume
-- `title`: Only appears when thinking=OFF and search=OFF, indicates auto-generated session title
+- `title`: Auto-generated session title, independent of thinking/search toggles
 
-Note: `event: title` and `event: close` may not always appear. The most reliable end signals are `event: finish` or `response/status` changing to `FINISHED`.
+**The most reliable end signals are `response/status` changing to `FINISHED` or `INCOMPLETE`.** `event: finish` may not appear; `title` and `close` may also be absent. `update_session` events may appear multiple times throughout the stream. Do not rely on event ordering to determine stream end.
 
 ## 5. edit_message
 - url: https://chat.deepseek.com/api/v0/chat/edit_message
@@ -440,21 +587,25 @@ Content-Type: text/plain
         "biz_code": 0,
         "biz_msg": "",
         "biz_data": {
-            "id": "file-12c6dd1a-e37b-4671-8d41-a5b0c6cc313b",
+            "id": "file-4387ddbe-efed-4459-83b0-ebb89db61f0f",
             "status": "PENDING",
-            "file_name": "test.txt",
-            "previewable": false,
-            "file_size": 23,
+            "file_name": "控制工程基础习题解= Introduction to control engineering solution to problems exercises ( 第4版 ).pdf",
+            "from_share": false,
+            "file_size": 36978670,
+            "model_kind": "NORMAL",
             "token_usage": null,
             "error_code": null,
-            "inserted_at": 1775387379.024,
-            "updated_at": 1775387379.024
+            "inserted_at": 1778644590.853,
+            "updated_at": 1778644590.853,
+            "is_image": false,
+            "audit_result": null
         }
     }
 }
 ```
 - Key field: `data.biz_data.id` (used as `ref_file_ids` in subsequent completion)
-- Note: After upload, `status` is `PENDING`; poll `fetch_files` until `status=SUCCESS`
+- After upload, `status` is `PENDING`; poll `fetch_files` until `status=SUCCESS`
+- Status flow: `PENDING` → `PARSING` → `SUCCESS` (or `FAILED`)
 
 ## 10. fetch_files?file_ids=<id>
 - url: https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=<id>
@@ -462,8 +613,9 @@ Content-Type: text/plain
   - `Authorization: Bearer <token>`
   - `User-Agent`: Required
 - Request Payload: None, GET operation
-- Response:
+- Response (multiple possible status stages):
 ```json
+# Parsing
 {
     "code": 0,
     "msg": "",
@@ -473,15 +625,47 @@ Content-Type: text/plain
         "biz_data": {
             "files": [
                 {
-                    "id": "file-12c6dd1a-e37b-4671-8d41-a5b0c6cc313b",
-                    "status": "SUCCESS",
-                    "file_name": "test.txt",
-                    "previewable": true,
-                    "file_size": 23,
-                    "token_usage": 4,
+                    "id": "file-4387ddbe-efed-4459-83b0-ebb89db61f0f",
+                    "status": "PARSING",
+                    "file_name": "控制工程基础习题解= Introduction to control engineering solution to problems exercises ( 第4版 ).pdf",
+                    "from_share": false,
+                    "file_size": 36978670,
+                    "model_kind": "NORMAL",
+                    "token_usage": null,
                     "error_code": null,
-                    "inserted_at": 1775387379.024,
-                    "updated_at": 1775387396.0
+                    "inserted_at": 1778644590.853,
+                    "updated_at": 1778644591.307,
+                    "is_image": false,
+                    "audit_result": null
+                }
+            ]
+        }
+    }
+}
+
+# Completed
+{
+    "code": 0,
+    "msg": "",
+    "data": {
+        "biz_code": 0,
+        "biz_msg": "",
+        "biz_data": {
+            "files": [
+                {
+                    "id": "file-eb550231-5bc4-4cb1-a8d2-49f8fed82247",
+                    "status": "SUCCESS",
+                    "file_name": "main.js",
+                    "from_share": false,
+                    "file_size": 2836902,
+                    "model_kind": "NORMAL",
+                    "token_usage": 619907,
+                    "error_code": null,
+                    "inserted_at": 1778644547.106,
+                    "updated_at": 1778644547.106,
+                    "signed_path": "/file?file_id=...",
+                    "is_image": false,
+                    "audit_result": null
                 }
             ]
         }
@@ -489,4 +673,10 @@ Content-Type: text/plain
 }
 ```
 - Key field: `files[].status` → `SUCCESS` indicates upload completed
-- `token_usage`: Token count consumed for file parsing
+- Status flow: `PENDING` → `PARSING` → `SUCCESS` (frontend treats both `PENDING` and `PARSING` as "in progress")
+- `model_kind`: File processing model type, `"NORMAL"` (text/PDF) or `"VISION"` (image/vision)
+- `is_image`: Whether the file is an image
+- `audit_result`: Audit result, images may show `"unknown"` (initial) → `"pass"` (approved)
+- `width` / `height`: Image dimensions in pixels (may appear after SUCCESS for images)
+- `token_usage`: Token count consumed for file parsing (only available after SUCCESS)
+- `signed_path`: May appear after SUCCESS, file download path

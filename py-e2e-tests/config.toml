@@ -1,3 +1,5 @@
+api_keys = []
+
 [[accounts]]
 email = "debatefeatgdcdve+mclendon@gmail.com"
 mobile = ""
@@ -50,18 +52,21 @@ password = "test12345"
 api_base = "https://chat.deepseek.com/api/v0"
 wasm_url = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
 user_agent = "DeepSeek/2.0.4 Android/35"
-client_version = "2.0.4"
+client_version = "2.1.0"
 client_platform = "android"
 client_locale = "zh_CN"
 model_types = [
     "default",
     "expert",
+    "vision",
 ]
 max_input_tokens = [
     1048576,
     1048576,
+    1048576,
 ]
 max_output_tokens = [
+    384000,
     384000,
     384000,
 ]
@@ -87,10 +92,6 @@ cors_origins = ["http://localhost:22217"]
 [proxy]
 
 [admin]
-password_hash = "$2b$12$p7MMNAKUkQVeJp5kgjFMU.BlMKi6Qo0r3KwmpruM4jlzRNaoDC5Sm"
-jwt_secret = "ec6568577f099c2fb91d84923cd9419c58e7b8a9c2564fcc3361debdade72f7b"
-jwt_issued_at = 1778399103
-
-[[api_keys]]
-key = "sk-test"
-description = "开发测试"
+password_hash = "$2b$12$SKq2TSFB8WGSUEjAl1fmSuai9TDAfMU53DEHk8bNKZFqqYTXKqt5q"
+jwt_secret = "19fc9c75863e029df11e4fc993673d75542910bb9c513b8270bc2b2ccc855db7"
+jwt_issued_at = 1778648095

@@ -154,7 +154,9 @@ where
                             None,
                         ))));
                     }
-                    DsFrame::Status(status) if status == "FINISHED" && !*this.finished => {
+                    DsFrame::Status(status)
+                        if (status == "FINISHED" || status == "INCOMPLETE") && !*this.finished =>
+                    {
                         trace!(target: "adapter", ">>> conv: finish=stop");
                         *this.finished = true;
                         // 将 usage 合并到 finish chunk，确保下游（如 Anthropic）能拿到 completion_tokens
@@ -166,7 +168,7 @@ where
                         }
                         return Poll::Ready(Some(Ok(chunk)));
                     }
-                    DsFrame::Status(_) | DsFrame::Finish => {}
+                    DsFrame::Status(_) => {}
                     DsFrame::Usage(u) => {
                         trace!(target: "adapter", ">>> conv: usage={}", u);
                         *this.usage_value = Some(u);

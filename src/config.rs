@@ -174,15 +174,19 @@ impl Default for DeepSeekConfig {
 }
 
 fn default_model_types() -> Vec<String> {
-    vec!["default".to_string(), "expert".to_string()]
+    vec![
+        "default".to_string(),
+        "expert".to_string(),
+        "vision".to_string(),
+    ]
 }
 
 fn default_max_input_tokens() -> Vec<u32> {
-    vec![1_048_576, 1_048_576]
+    vec![1_048_576, 1_048_576, 1_048_576]
 }
 
 fn default_max_output_tokens() -> Vec<u32> {
-    vec![384_000, 384_000]
+    vec![384_000, 384_000, 384_000]
 }
 
 impl DeepSeekConfig {
@@ -237,7 +241,7 @@ fn default_user_agent() -> String {
 
 /// 默认 X-Client-Version
 fn default_client_version() -> String {
-    "2.0.4".to_string()
+    "2.1.0".to_string()
 }
 
 /// 默认 X-Client-Platform
